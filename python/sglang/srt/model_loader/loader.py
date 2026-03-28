@@ -2781,6 +2781,11 @@ class ModelOptModelLoader(DefaultModelLoader):
         # Check if model is already quantized
         if model_config._is_already_quantized():
             logger.info("Model is already quantized, loading directly...")
+            if self.load_config.load_format == LoadFormat.SHARDED_STATE:
+                sharded_state_loader = ShardedStateLoader(self.load_config)
+                return sharded_state_loader.load_model(
+                    model_config=model_config, device_config=device_config
+                )
             # Use default loading for pre-quantized models
             return super().load_model(
                 model_config=model_config, device_config=device_config
