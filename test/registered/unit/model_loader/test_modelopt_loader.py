@@ -480,7 +480,12 @@ class TestModelOptModelLoader(CustomTestCase):
     def test_prequantized_sharded_state_uses_sharded_loader(self):
         """Pre-quantized ModelOpt checkpoints should respect sharded_state format."""
 
-        loader = ModelOptModelLoader(LoadConfig(load_format=LoadFormat.SHARDED_STATE))
+        loader = ModelOptModelLoader(
+            LoadConfig(
+                load_format=LoadFormat.SHARDED_STATE,
+                model_loader_extra_config={"pattern": "custom-rank-{rank}.safetensors"},
+            )
+        )
         model_config = MagicMock(spec=ModelConfig)
         model_config.model_path = self.model_path
         model_config._is_already_quantized.return_value = True
