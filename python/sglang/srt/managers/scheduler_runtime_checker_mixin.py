@@ -276,7 +276,7 @@ class SchedulerRuntimeCheckerMixin:
         err_rids: dict[str, set[str]] = {}
         conflicts_rids: dict[str, str] = {}
 
-        def check_reqs(reqs: list, container_name: str):
+        def check_reqs(reqs: Sequence[Req], container_name: str):
             for req in reqs:
                 if req.rid in conflicts_rids:
                     err_rids.setdefault(req.rid, set()).update(
