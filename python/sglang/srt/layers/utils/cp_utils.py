@@ -247,6 +247,34 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     return output_tensor
 
 
+def cp_all_gather_rerange_cache_loc(cache_loc, cp_size, forward_batch):
+    max_len = (forward_batch.attn_cp_metadata.total_seq_lens + cp_size - 1) // cp_size
+    pad_size = max_len - cache_loc.shape[0]
+    if pad_size > 0:
+        cache_loc = F.pad(cache_loc, (0, pad_size), mode="constant", value=0)
+
+    cache_loc_full = get_attention_cp_group().all_gather(cache_loc, dim=0)
+    outputs_list_max = list(
+        torch.split(cache_loc_full, forward_batch.attn_cp_metadata.max_rank_len, dim=0)
+    )
+    outputs = torch.cat(
+        [
+            outputs_list_max[index][:per_rank_len]
+            for index, per_rank_len in enumerate(
+                forward_batch.attn_cp_metadata.per_rank_actual_token
+            )
+        ],
+        dim=0,
+    )
+    outputs_list = list(
+        torch.split(outputs, forward_batch.attn_cp_metadata.reverse_split_len, dim=0)
+    )
+    return torch.cat(
+        [outputs_list[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index],
+        dim=0,
+    )
+
+
 def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
     """
     Allgather KV cache from all CP ranks and write the full result
@@ -267,15 +295,24 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
     value_cache_full = cp_all_gather_rerange_kv_cache(
         v, cp_size, forward_batch, torch.cuda.current_stream()
     )
+    if cache_loc.shape[0] == key_cache_full.shape[0]:
+        cache_loc_full = cache_loc
+    else:
+        cache_loc_full = cp_all_gather_rerange_cache_loc(
+            cache_loc, cp_size, forward_batch
+        )
+    token_to_kv_pool = forward_batch.token_to_kv_pool
+    if key_cache_full.dtype != token_to_kv_pool.dtype:
+        if layer.k_scale is not None:
+            key_cache_full = key_cache_full / layer.k_scale
+        if layer.v_scale is not None:
+            value_cache_full = value_cache_full / layer.v_scale
+        key_cache_full = key_cache_full.to(token_to_kv_pool.dtype)
+        value_cache_full = value_cache_full.to(token_to_kv_pool.dtype)
 
-    forward_batch.token_to_kv_pool.set_kv_buffer(
-        layer,
-        cache_loc,
-        key_cache_full,
-        value_cache_full,
-        layer.k_scale,
-        layer.v_scale,
-    )
+    key_buffer, value_buffer = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+    key_buffer[cache_loc_full] = key_cache_full
+    value_buffer[cache_loc_full] = value_cache_full
 
 
 def cp_attn_forward_extend(

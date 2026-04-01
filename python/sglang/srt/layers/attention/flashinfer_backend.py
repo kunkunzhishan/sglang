@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.layers.utils.cp_utils import cp_allgather_and_save_kv_cache
+
 """
 Support different attention backends.
 Now there are two backends: FlashInfer and Triton.
@@ -25,8 +27,13 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_cp_rank, get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.layers.utils.cp_utils import (
+    can_cp_split,
+    is_prefill_context_parallel_enabled,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -128,6 +135,12 @@ class FlashInferAttnBackend(AttentionBackend):
         super().__init__()
         self.prefill_backend = "fa2"
         self.decode_backend = "fa2"
+        self.attn_cp_size = model_runner.attn_cp_size
+        self.attn_cp_rank = (
+            model_runner.attn_cp_rank
+            if model_runner.attn_cp_rank is not None
+            else get_attention_cp_rank()
+        )
 
         # Store multi-item scoring delimiter for efficient access
         self.multi_item_scoring_delimiter = (
@@ -427,7 +440,31 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
 
+    def _maybe_prepare_prefill_cp_metadata(self, forward_batch: ForwardBatch):
+        if (
+            forward_batch.attn_cp_metadata is not None
+            or not is_prefill_context_parallel_enabled()
+            or not forward_batch.forward_mode.is_context_parallel_extend()
+        ):
+            return
+
+        if can_cp_split(forward_batch.seq_lens_sum, self.attn_cp_size, forward_batch):
+            logger.warning(
+                "DEBUG flashinfer cp meta prepare: seq_lens_sum=%s seq_lens_cpu=%s cp_rank=%s cp_size=%s",
+                forward_batch.seq_lens_sum,
+                forward_batch.seq_lens_cpu.tolist() if forward_batch.seq_lens_cpu is not None else None,
+                self.attn_cp_rank,
+                self.attn_cp_size,
+            )
+            forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                forward_batch.seq_lens_sum,
+                self.attn_cp_rank,
+                self.attn_cp_size,
+                forward_batch.seq_lens_cpu.tolist(),
+            )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self._maybe_prepare_prefill_cp_metadata(forward_batch)
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -452,6 +489,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
+                forward_batch=forward_batch,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged, False, False
@@ -467,6 +505,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
+                forward_batch=forward_batch,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify, False, False
@@ -474,8 +513,15 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
+            is_cp_mode = (forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+            and self.attn_cp_size > 1)
+            
+            if is_cp_mode:
+                use_ragged = False
+                extend_no_prefix = False
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
-            if self.is_multimodal or self.multi_item_scoring_delimiter is not None:
+            elif self.is_multimodal or self.multi_item_scoring_delimiter is not None:
                 # use_ragged = False: Multi-item scoring requires the paged wrapper because:
                 # 1. Ragged wrapper doesn't support the specialized multi-item parameters
                 #    (prefix_len_ptr, token_pos_in_items_ptr, etc.)
@@ -508,6 +554,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=None,
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
+                forward_batch=forward_batch,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -772,6 +819,12 @@ class FlashInferAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
+        is_cp_mode = (
+            forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+            and self.attn_cp_size > 1
+        )
+
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
@@ -779,9 +832,14 @@ class FlashInferAttnBackend(AttentionBackend):
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                    if is_cp_mode:
+                        cp_allgather_and_save_kv_cache(
+                            forward_batch, layer, k, v, self.attn_cp_size
+                        )
+                    else:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        )
 
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -886,6 +944,16 @@ class FlashInferAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
+        if (
+            cache_loc is not None
+            and k is not None
+            and self.attn_cp_size > 1
+            and cache_loc.numel() != k.shape[0]
+            and cache_loc.numel() == k.shape[0] * self.attn_cp_size
+        ):
+            cache_loc = cache_loc.view(k.shape[0], self.attn_cp_size)[
+                :, self.attn_cp_rank
+            ].contiguous()
 
         if k is not None:
             assert v is not None
@@ -1196,6 +1264,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.attn_cp_size = attn_backend.attn_cp_size
         self.page_size = attn_backend.page_size
 
         # Buffers and wrappers
@@ -1227,6 +1296,7 @@ class FlashInferIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
+        multi_item_params: Optional[MultiItemScoringParams] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1244,6 +1314,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -1269,6 +1340,7 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            forward_batch=forward_batch
         )
 
     def update_sliding_window(
@@ -1284,6 +1356,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1318,6 +1391,7 @@ class FlashInferIndicesUpdaterPrefill:
                 spec_info,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
                 multi_item_params=multi_item_params,
+                forward_batch=forward_batch
             )
 
     def update_cross_attention(
@@ -1333,6 +1407,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1360,6 +1435,7 @@ class FlashInferIndicesUpdaterPrefill:
                 use_ragged,
                 spec_info,
                 multi_item_params=multi_item_params,
+                forward_batch=forward_batch
             )
 
     def call_begin_forward(
@@ -1379,7 +1455,31 @@ class FlashInferIndicesUpdaterPrefill:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
+        if (
+            forward_batch is not None and
+            forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+            and self.attn_cp_size > 1):
+            return self.call_begin_forward_cp(
+                wrapper_ragged,
+                wrapper_paged,
+                req_pool_indices,
+                paged_kernel_lens,
+                paged_kernel_lens_sum,
+                seq_lens,
+                prefix_lens,
+                kv_start_idx,
+                kv_indptr,
+                qo_indptr,
+                use_ragged,
+                spec_info,
+                use_sliding_window_kv_pool,
+                fixed_split_size,
+                multi_item_params,
+                forward_batch
+            )
         bs = len(seq_lens)
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
@@ -1489,6 +1589,153 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_ptr = None
             token_pos_in_items_len = 0
             max_item_len_ptr = None
+
+        wrapper_paged.begin_forward(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            self.kv_last_page_len[:bs_eff],
+            self.num_qo_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            1,
+            q_data_type=self.q_data_type,
+            kv_data_type=self.data_type,
+            custom_mask=use_custom_mask,
+            non_blocking=True,
+            fixed_split_size=fixed_split_size,
+            prefix_len_ptr=prefix_len_ptr,
+            token_pos_in_items_ptr=token_pos_in_items_ptr,
+            token_pos_in_items_len=token_pos_in_items_len,
+            max_item_len_ptr=max_item_len_ptr,
+        )
+    
+    def call_begin_forward_cp(
+        self,
+        wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
+        wrapper_paged: BatchPrefillWithPagedKVCacheWrapper,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens_sum: int,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        kv_start_idx: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        use_ragged: bool,
+        spec_info: Optional[SpecInput],
+        use_sliding_window_kv_pool: bool = False,
+        fixed_split_size: Optional[int] = None,
+        multi_item_params: Optional[MultiItemScoringParams] = None,
+        forward_batch: Optional[ForwardBatch] = None,
+    ):
+        assert forward_batch is not None
+        assert forward_batch.attn_cp_metadata is not None
+        assert not use_ragged, "CP prefill for flashinfer only supports paged mode for now"
+        assert spec_info is None, "CP prefill for flashinfer does not support spec_info yet"
+        assert not use_sliding_window_kv_pool, "CP prefill for flashinfer does not support SWA yet"
+        assert multi_item_params is None or not multi_item_params.is_enabled(), (
+            "CP prefill for flashinfer does not support multi-item scoring yet"
+        )
+
+        bs = len(seq_lens)
+        assert bs == 1
+        device = req_pool_indices.device
+        actual_seq_q_prev = forward_batch.attn_cp_metadata.actual_seq_q_prev
+        actual_seq_q_next = forward_batch.attn_cp_metadata.actual_seq_q_next
+        kv_len_prev = forward_batch.attn_cp_metadata.kv_len_prev
+        kv_len_next = forward_batch.attn_cp_metadata.kv_len_next
+        # assert len(seq_lens) == len(req_pool_indices)
+        # Normal extend
+        kv_indptr = torch.tensor([0, kv_len_prev, kv_len_prev + kv_len_next], dtype=torch.int32, device=kv_indptr.device)
+        # Reserve extra space in kv_indices for a potential piecewise CUDA graph
+        # dummy request (see below). Worst case: static_num_tokens extra pages.
+        fwd_ctx = get_forward_context()
+        pcg_num_tokens = fwd_ctx.num_tokens if fwd_ctx is not None else None
+        extra_kv = pcg_num_tokens if pcg_num_tokens is not None else 0
+        kv_total = kv_len_prev + kv_len_next
+        kv_indices = torch.empty(
+            kv_total + extra_kv + 256,
+            dtype=torch.int32,
+            device=device,
+        )
+        bs_cp = 2
+        req_idx = req_pool_indices[0]
+        req_pool_indices_cp = torch.tensor(
+            [req_idx, req_idx],
+            dtype=req_pool_indices.dtype,
+            device=device,
+        )
+        paged_kernel_lens_cp = torch.tensor(
+            [kv_len_prev, kv_len_next],
+            dtype=torch.int32,
+            device=device,
+        )
+
+        kv_start_idx_cp = torch.zeros(
+            2,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        create_flashinfer_kv_indices_triton[(bs_cp,)](
+            self.req_to_token,
+            req_pool_indices_cp,
+            paged_kernel_lens_cp,
+            kv_indptr,
+            kv_start_idx_cp,
+            kv_indices,
+            self.req_to_token.shape[1],
+        )
+        qo_indptr = torch.tensor([0, actual_seq_q_prev, actual_seq_q_prev + actual_seq_q_next],dtype = torch.int32, device=qo_indptr.device)
+
+        # Piecewise CUDA graph padding: input_ids are padded to static_num_tokens,
+        # so q.shape[0] == static_num_tokens but qo_indptr[-1] == actual tokens.
+        # Append a dummy request for the padding tokens so that
+        # qo_indptr[-1] == static_num_tokens, satisfying flashinfer's shape check
+        # without corrupting the causal masks of real requests.
+        # The dummy request's KV indices all point to slot 0 (a scratch location);
+        # its attention output is discarded via the [:raw_num_tokens] slice in replay.
+        bs_eff = bs_cp
+        # extend_num_tokens is a Python int (== sum of seq_lens - prefix_lens),
+        # and paged_kernel_lens_sum is also a Python int (== kv_indptr[-1]),
+        # so this block requires no CPU-GPU synchronisation.
+        actual_qo_tokens = (
+            actual_seq_q_prev + actual_seq_q_next
+        )
+        custom_mask = None
+        if (
+            pcg_num_tokens is not None
+            and actual_qo_tokens is not None
+            and pcg_num_tokens > actual_qo_tokens
+        ):
+            pad_tokens = pcg_num_tokens - actual_qo_tokens
+            num_dummy_pages = (pad_tokens + self.page_size - 1) // self.page_size
+            kv_start = (
+                kv_total  # equals kv_indptr[-1], no .item() needed
+            )
+            kv_indices[kv_start : kv_start + num_dummy_pages] = 0
+            qo_indptr = torch.cat(
+                [qo_indptr, qo_indptr.new_tensor([pcg_num_tokens])]
+            )
+            kv_indptr = torch.cat(
+                [kv_indptr, kv_indptr.new_tensor([kv_start + num_dummy_pages])]
+            )
+            bs_eff = bs_cp + 1
+
+        if use_sliding_window_kv_pool:
+            kv_last_index = kv_indptr[-1]
+            kv_indices[:kv_last_index] = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    kv_indices[:kv_last_index]
+                )
+            )
+        
+        use_custom_mask = custom_mask
+        prefix_len_ptr = None
+        token_pos_in_items_ptr = None
+        token_pos_in_items_len = 0
+        max_item_len_ptr = None
 
         wrapper_paged.begin_forward(
             qo_indptr,
@@ -1637,6 +1884,13 @@ class FlashInferMultiStepDraftBackend:
             )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
+        is_cp_mode = (forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+            and self.attn_cp_size > 1)
+        if is_cp_mode:
+            raise NotImplementedError(
+                "FlashInfer prefill context parallel does not support CUDA graph yet."
+            )
         def call_fn(i, forward_batch):
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
                 forward_batch.batch_size,
@@ -1653,6 +1907,13 @@ class FlashInferMultiStepDraftBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
+        is_cp_mode = (forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+            and self.attn_cp_size > 1)
+        if is_cp_mode:
+            raise NotImplementedError(
+                "FlashInfer prefill context parallel does not support CUDA graph yet."
+            )
         def call_fn(i, forward_batch):
             self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
                 bs,
