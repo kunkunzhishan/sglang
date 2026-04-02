@@ -247,9 +247,8 @@ def _run_flashinfer_cp_worker(
         local_q = _split_for_cp(full_q, cp_meta)
         local_k = _split_for_cp(full_k, cp_meta)
         local_v = _split_for_cp(full_v, cp_meta)
-        local_cache_loc = _split_for_cp(
-            torch.arange(prefix_len, total_len, dtype=torch.int32, device=device),
-            cp_meta,
+        full_cache_loc = torch.arange(
+            prefix_len, total_len, dtype=torch.int32, device=device
         )
 
         _setup_prefix_kv_cache(model_runner.token_to_kv_pool, layer, prefix_k, prefix_v)
@@ -271,10 +270,12 @@ def _run_flashinfer_cp_worker(
 
         cp_forward_batch = _build_forward_batch(
             backend,
-            input_ids=torch.randint(0, 100, (1, local_q.shape[0]), device=device),
-            out_cache_loc=local_cache_loc,
+            # In production, CP splits q/k/v via hidden_states sharding, while
+            # ForwardBatch metadata (including out_cache_loc) remains global.
+            input_ids=torch.randint(0, 100, (1, q_len), device=device),
+            out_cache_loc=full_cache_loc,
             seq_len=total_len,
-            extend_len=local_q.shape[0],
+            extend_len=q_len,
             prefix_len=prefix_len,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             req_to_token_pool=model_runner.req_to_token_pool,
