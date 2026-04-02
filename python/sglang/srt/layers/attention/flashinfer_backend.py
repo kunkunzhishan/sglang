@@ -29,11 +29,6 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_cp_rank, get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import (
-    can_cp_split,
-    is_prefill_context_parallel_enabled,
-    prepare_context_parallel_metadata,
-)
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -440,31 +435,7 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
 
-    def _maybe_prepare_prefill_cp_metadata(self, forward_batch: ForwardBatch):
-        if (
-            forward_batch.attn_cp_metadata is not None
-            or not is_prefill_context_parallel_enabled()
-            or not forward_batch.forward_mode.is_context_parallel_extend()
-        ):
-            return
-
-        if can_cp_split(forward_batch.seq_lens_sum, self.attn_cp_size, forward_batch):
-            logger.warning(
-                "DEBUG flashinfer cp meta prepare: seq_lens_sum=%s seq_lens_cpu=%s cp_rank=%s cp_size=%s",
-                forward_batch.seq_lens_sum,
-                forward_batch.seq_lens_cpu.tolist() if forward_batch.seq_lens_cpu is not None else None,
-                self.attn_cp_rank,
-                self.attn_cp_size,
-            )
-            forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                forward_batch.seq_lens_sum,
-                self.attn_cp_rank,
-                self.attn_cp_size,
-                forward_batch.seq_lens_cpu.tolist(),
-            )
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        self._maybe_prepare_prefill_cp_metadata(forward_batch)
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
