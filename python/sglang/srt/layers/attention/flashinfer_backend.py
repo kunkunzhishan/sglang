@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from sglang.srt.layers.utils.cp_utils import cp_allgather_and_save_kv_cache
-
 """
 Support different attention backends.
 Now there are two backends: FlashInfer and Triton.
@@ -29,6 +27,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_cp_rank, get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.layers.utils.cp_utils import cp_allgather_and_save_kv_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -1429,10 +1428,16 @@ class FlashInferIndicesUpdaterPrefill:
         forward_batch: Optional[ForwardBatch] = None,
     ):
         if (
-            forward_batch is not None and
-            forward_batch.forward_mode.is_context_parallel_extend()
+            forward_batch is not None
+            and kv_start_idx is None
+            and not use_ragged
+            and spec_info is None
+            and not use_sliding_window_kv_pool
+            and (multi_item_params is None or not multi_item_params.is_enabled())
+            and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
-            and self.attn_cp_size > 1):
+            and self.attn_cp_size > 1
+        ):
             return self.call_begin_forward_cp(
                 wrapper_ragged,
                 wrapper_paged,
@@ -1608,6 +1613,9 @@ class FlashInferIndicesUpdaterPrefill:
         assert multi_item_params is None or not multi_item_params.is_enabled(), (
             "CP prefill for flashinfer does not support multi-item scoring yet"
         )
+        assert (
+            kv_start_idx is None
+        ), "CP prefill for flashinfer does not support kv_start_idx (encoder-decoder / cross-attention) yet"
 
         bs = len(seq_lens)
         assert bs == 1
@@ -1616,21 +1624,37 @@ class FlashInferIndicesUpdaterPrefill:
         actual_seq_q_next = forward_batch.attn_cp_metadata.actual_seq_q_next
         kv_len_prev = forward_batch.attn_cp_metadata.kv_len_prev
         kv_len_next = forward_batch.attn_cp_metadata.kv_len_next
-        # assert len(seq_lens) == len(req_pool_indices)
-        # Normal extend
-        kv_indptr = torch.tensor([0, kv_len_prev, kv_len_prev + kv_len_next], dtype=torch.int32, device=kv_indptr.device)
+        assert len(seq_lens) == len(req_pool_indices)
+
+        # FlashInfer's prefill wrapper plans work per batch item. Under CP, each
+        # *real* request is split into (prev, next) query chunks on each rank.
+        # We represent these two chunks as two *virtual* requests so that the
+        # wrapper can plan different (qo_len, visible_kv_len) for each chunk.
+        bs_cp = 2
+        kv_total = kv_len_prev + kv_len_next
+        actual_qo_tokens = actual_seq_q_prev + actual_seq_q_next
+
+        # Write into the provided buffers to match non-CP behaviour.
+        kv_indptr_buf = kv_indptr[: bs_cp + 1]
+        kv_indptr_buf[0] = 0
+        kv_indptr_buf[1] = kv_len_prev
+        kv_indptr_buf[2] = kv_total
+
+        qo_indptr_buf = qo_indptr[: bs_cp + 1]
+        qo_indptr_buf[0] = 0
+        qo_indptr_buf[1] = actual_seq_q_prev
+        qo_indptr_buf[2] = actual_qo_tokens
+
         # Reserve extra space in kv_indices for a potential piecewise CUDA graph
         # dummy request (see below). Worst case: static_num_tokens extra pages.
         fwd_ctx = get_forward_context()
         pcg_num_tokens = fwd_ctx.num_tokens if fwd_ctx is not None else None
         extra_kv = pcg_num_tokens if pcg_num_tokens is not None else 0
-        kv_total = kv_len_prev + kv_len_next
         kv_indices = torch.empty(
             kv_total + extra_kv + 256,
             dtype=torch.int32,
             device=device,
         )
-        bs_cp = 2
         req_idx = req_pool_indices[0]
         req_pool_indices_cp = torch.tensor(
             [req_idx, req_idx],
@@ -1653,12 +1677,11 @@ class FlashInferIndicesUpdaterPrefill:
             self.req_to_token,
             req_pool_indices_cp,
             paged_kernel_lens_cp,
-            kv_indptr,
+            kv_indptr_buf,
             kv_start_idx_cp,
             kv_indices,
             self.req_to_token.shape[1],
         )
-        qo_indptr = torch.tensor([0, actual_seq_q_prev, actual_seq_q_prev + actual_seq_q_next],dtype = torch.int32, device=qo_indptr.device)
 
         # Piecewise CUDA graph padding: input_ids are padded to static_num_tokens,
         # so q.shape[0] == static_num_tokens but qo_indptr[-1] == actual tokens.
@@ -1668,12 +1691,6 @@ class FlashInferIndicesUpdaterPrefill:
         # The dummy request's KV indices all point to slot 0 (a scratch location);
         # its attention output is discarded via the [:raw_num_tokens] slice in replay.
         bs_eff = bs_cp
-        # extend_num_tokens is a Python int (== sum of seq_lens - prefix_lens),
-        # and paged_kernel_lens_sum is also a Python int (== kv_indptr[-1]),
-        # so this block requires no CPU-GPU synchronisation.
-        actual_qo_tokens = (
-            actual_seq_q_prev + actual_seq_q_next
-        )
         custom_mask = None
         if (
             pcg_num_tokens is not None
@@ -1686,12 +1703,11 @@ class FlashInferIndicesUpdaterPrefill:
                 kv_total  # equals kv_indptr[-1], no .item() needed
             )
             kv_indices[kv_start : kv_start + num_dummy_pages] = 0
-            qo_indptr = torch.cat(
-                [qo_indptr, qo_indptr.new_tensor([pcg_num_tokens])]
-            )
-            kv_indptr = torch.cat(
-                [kv_indptr, kv_indptr.new_tensor([kv_start + num_dummy_pages])]
-            )
+            # Use the next slots in the buffers to avoid allocating new tensors.
+            qo_indptr_buf = qo_indptr[: bs_cp + 2]
+            kv_indptr_buf = kv_indptr[: bs_cp + 2]
+            qo_indptr_buf[bs_cp + 1] = pcg_num_tokens
+            kv_indptr_buf[bs_cp + 1] = kv_start + num_dummy_pages
             bs_eff = bs_cp + 1
 
         if use_sliding_window_kv_pool:
@@ -1709,8 +1725,8 @@ class FlashInferIndicesUpdaterPrefill:
         max_item_len_ptr = None
 
         wrapper_paged.begin_forward(
-            qo_indptr,
-            kv_indptr,
+            qo_indptr_buf[: bs_eff + 1],
+            kv_indptr_buf[: bs_eff + 1],
             kv_indices,
             self.kv_last_page_len[:bs_eff],
             self.num_qo_heads,
