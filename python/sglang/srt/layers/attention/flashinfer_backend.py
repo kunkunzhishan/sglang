@@ -434,6 +434,30 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
 
+    def _validate_prefill_cp_support(self, forward_batch: ForwardBatch):
+        if forward_batch.spec_info is not None:
+            raise NotImplementedError(
+                "FlashInfer prefill context parallel does not support spec_info yet."
+            )
+        if self.multi_item_scoring_delimiter is not None:
+            raise NotImplementedError(
+                "FlashInfer prefill context parallel does not support multi-item scoring yet."
+            )
+        if self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
+            raise NotImplementedError(
+                "FlashInfer prefill context parallel does not support sliding window yet."
+            )
+        if self.dispatch_reason == WrapperDispatch.CROSS_ATTENTION:
+            raise NotImplementedError(
+                "FlashInfer prefill context parallel does not support encoder-decoder / cross-attention yet."
+            )
+
+    def _raise_if_prefill_cp_cuda_graph_unsupported(self, forward_mode: ForwardMode):
+        if forward_mode.is_context_parallel_extend() and self.attn_cp_size > 1:
+            raise NotImplementedError(
+                "FlashInfer prefill context parallel does not support CUDA graph yet."
+            )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -486,8 +510,9 @@ class FlashInferAttnBackend(AttentionBackend):
             is_cp_mode = (forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
             and self.attn_cp_size > 1)
-            
+
             if is_cp_mode:
+                self._validate_prefill_cp_support(forward_batch)
                 use_ragged = False
                 extend_no_prefix = False
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
@@ -577,6 +602,7 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
+        self._raise_if_prefill_cp_cuda_graph_unsupported(forward_mode)
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
             for i in range(self.num_wrappers):
@@ -716,6 +742,7 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
+        self._raise_if_prefill_cp_cuda_graph_unsupported(forward_mode)
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
@@ -1607,15 +1634,11 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         assert forward_batch is not None
         assert forward_batch.attn_cp_metadata is not None
-        assert not use_ragged, "CP prefill for flashinfer only supports paged mode for now"
-        assert spec_info is None, "CP prefill for flashinfer does not support spec_info yet"
-        assert not use_sliding_window_kv_pool, "CP prefill for flashinfer does not support SWA yet"
-        assert multi_item_params is None or not multi_item_params.is_enabled(), (
-            "CP prefill for flashinfer does not support multi-item scoring yet"
-        )
-        assert (
-            kv_start_idx is None
-        ), "CP prefill for flashinfer does not support kv_start_idx (encoder-decoder / cross-attention) yet"
+        assert not use_ragged
+        assert spec_info is None
+        assert not use_sliding_window_kv_pool
+        assert multi_item_params is None or not multi_item_params.is_enabled()
+        assert kv_start_idx is None
 
         bs = len(seq_lens)
         assert bs == 1
