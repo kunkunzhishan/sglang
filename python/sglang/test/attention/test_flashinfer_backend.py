@@ -179,7 +179,12 @@ def _setup_prefix_kv_cache(
     if prefix_k.numel() == 0:
         return
 
-    cache_loc = torch.arange(prefix_k.shape[0], device=prefix_k.device)
+    # Keep the same "slot id" convention as req_to_token_pool in this test:
+    # token position t is stored at slot (t + page_size).
+    cache_loc = (
+        torch.arange(prefix_k.shape[0], device=prefix_k.device, dtype=torch.int32)
+        + token_to_kv_pool.page_size
+    )
     token_to_kv_pool.set_kv_buffer(
         layer,
         cache_loc,
@@ -197,6 +202,7 @@ def _run_flashinfer_cp_worker(
     prefix_len: int,
     num_heads: int,
     head_dim: int,
+    page_size: int = 1,
 ):
     torch.cuda.set_device(rank)
     device = f"cuda:{rank}"
@@ -206,7 +212,7 @@ def _run_flashinfer_cp_worker(
     model_runner = MockModelRunner(
         rank=rank,
         world_size=world_size,
-        page_size=1,
+        page_size=page_size,
         num_heads=num_heads,
         head_dim=head_dim,
     )
@@ -247,8 +253,11 @@ def _run_flashinfer_cp_worker(
         local_q = _split_for_cp(full_q, cp_meta)
         local_k = _split_for_cp(full_k, cp_meta)
         local_v = _split_for_cp(full_v, cp_meta)
-        full_cache_loc = torch.arange(
-            prefix_len, total_len, dtype=torch.int32, device=device
+        # Keep out_cache_loc consistent with req_to_token: token position t maps to
+        # slot (t + page_size).
+        full_cache_loc = (
+            torch.arange(prefix_len, total_len, dtype=torch.int32, device=device)
+            + page_size
         )
 
         _setup_prefix_kv_cache(model_runner.token_to_kv_pool, layer, prefix_k, prefix_v)
@@ -256,7 +265,7 @@ def _run_flashinfer_cp_worker(
         ref_forward_batch = _build_forward_batch(
             ref_backend,
             input_ids=torch.randint(0, 100, (1, q_len), device=device),
-            out_cache_loc=torch.arange(prefix_len, total_len, dtype=torch.int32, device=device),
+            out_cache_loc=full_cache_loc,
             seq_len=total_len,
             extend_len=q_len,
             prefix_len=prefix_len,
@@ -335,6 +344,21 @@ class TestFlashInferBackend(CustomTestCase):
             prefix_len=64,
             num_heads=8,
             head_dim=64,
+        )
+
+    def test_forward_extend_cp_with_prefix_page_size_16(self):
+        if torch.cuda.device_count() < 2:
+            self.skipTest("FlashInfer CP test requires at least 2 GPUs")
+
+        run_distributed_test(
+            _run_flashinfer_cp_worker,
+            world_size=2,
+            backend="nccl",
+            q_len=128,
+            prefix_len=64,
+            num_heads=8,
+            head_dim=64,
+            page_size=16,
         )
 
 
