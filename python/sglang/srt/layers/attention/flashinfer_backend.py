@@ -452,12 +452,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 "FlashInfer prefill context parallel does not support encoder-decoder / cross-attention yet."
             )
 
-    def _raise_if_prefill_cp_cuda_graph_unsupported(self, forward_mode: ForwardMode):
-        if forward_mode.is_context_parallel_extend() and self.attn_cp_size > 1:
-            raise NotImplementedError(
-                "FlashInfer prefill context parallel does not support CUDA graph yet."
-            )
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -602,7 +596,6 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
-        self._raise_if_prefill_cp_cuda_graph_unsupported(forward_mode)
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
             for i in range(self.num_wrappers):
@@ -742,7 +735,6 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        self._raise_if_prefill_cp_cuda_graph_unsupported(forward_mode)
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
